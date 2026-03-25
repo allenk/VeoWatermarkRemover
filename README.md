@@ -90,8 +90,7 @@ For the full technical background on reverse alpha blending, see:
 To verify the download integrity, check the hash values:
 
 ```
-SHA256: 2c2180f5c096cc4f13f4753338e3419c9c01f89fbfefd80640874be7918b47f0
-MD5:    9f7de5fb4a31552a495d702ea29bc03d
+SHA256: 601ac4be3c32b0e7a652d4ecbcbd9b0f0a7794e0f699648296978b0697429932
 ```
 
 You can verify with PowerShell:
@@ -103,7 +102,7 @@ Get-FileHash .\GeminiWatermarkTool.exe -Algorithm SHA256
 
 **0 detections / 72 engines** — verified clean.
 
-[View full VirusTotal report](https://www.virustotal.com/gui/file/2c2180f5c096cc4f13f4753338e3419c9c01f89fbfefd80640874be7918b47f0/detection)
+[View full VirusTotal report](https://www.virustotal.com/gui/file/601ac4be3c32b0e7a652d4ecbcbd9b0f0a7794e0f699648296978b0697429932)
 
 > **If you're not comfortable running an unsigned executable, that's completely fine.**
 > This is a demo build for early testing. The Veo removal feature will be integrated into the main [GeminiWatermarkTool](https://github.com/allenk/GeminiWatermarkTool) release when ready, with full source code, CI/CD builds, and cross-platform support.

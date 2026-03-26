@@ -6,6 +6,8 @@
 [![Based on GWT](https://img.shields.io/badge/Based%20on-GeminiWatermarkTool-green.svg)](https://github.com/allenk/GeminiWatermarkTool)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://github.com/allenk/GeminiWatermarkTool/blob/main/LICENSE)
 
+> **NEW: Watch the demo video on YouTube — [Veo Watermark Remover in Action](https://www.youtube.com/watch?v=adFNiWQUb54)**
+>
 > **This is a demo/preview build of the upcoming Veo watermark removal feature for [GeminiWatermarkTool](https://github.com/allenk/GeminiWatermarkTool).**
 > Once stabilized, this functionality will be merged into the main GWT release with full GUI support.
 

@@ -51,13 +51,13 @@ def detect_watermark(frame: np.ndarray, search_w: int = 200, search_h: int = 250
     if (x_max - x_min) > search_w * 0.9 or (y_max - y_min) > search_h * 0.9:
         return None
 
-    # Add padding
-    pad = 10
+    # Add padding (extra on left/top where diamond tip tends to be clipped)
+    pad_left, pad_top, pad_right, pad_bottom = 18, 15, 10, 10
     return (
-        max(0, roi_x + x_min - pad),
-        max(0, roi_y + y_min - pad),
-        min(w, roi_x + x_max + pad),
-        min(h, roi_y + y_max + pad),
+        max(0, roi_x + x_min - pad_left),
+        max(0, roi_y + y_min - pad_top),
+        min(w, roi_x + x_max + pad_right),
+        min(h, roi_y + y_max + pad_bottom),
     )
 
 
@@ -155,7 +155,7 @@ def process(input_path: str, output_path: str):
             check=True
         )
 
-    print(f"Done → {output_path}")
+    print(f"Done -> {output_path}")
 
 
 def main():

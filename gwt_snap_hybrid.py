@@ -3,9 +3,9 @@
 Hybrid watermark removal:
 1. Build a fixed diamond mask from the best reference frame (dark background).
 2. Run GWT snap on each frame for reverse alpha blending.
-3. Within the fixed mask area, check if significant residual remains.
-   If yes: inpaint only those residual pixels using the fixed mask.
-   This avoids per-frame Otsu which mistakenly picks up skin/fabric.
+3. Check if GWT created a dark shadow artifact (over-subtracted the background).
+   - If dark shadow detected: revert to original + fixed-mask inpaint (radius 15)
+   - Otherwise: keep GWT result + fix any bright residual with fixed-mask inpaint
 """
 import os, sys, subprocess, tempfile
 import cv2, numpy as np
@@ -23,7 +23,7 @@ def get_fps(path):
 def detect_region(frame_path):
     img = cv2.imread(frame_path)
     h, w = img.shape[:2]
-    roi_x, roi_y = w-200, h-250
+    roi_x, roi_y = w-220, h-250  # wider to avoid clipping diamond left edge
     roi = img[roi_y:h, roi_x:w]
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
     bright = (gray > 80).astype(np.uint8)
@@ -37,11 +37,7 @@ def detect_region(frame_path):
             min(h,roi_y+y_max+pad)-max(0,roi_y+y_min-pad))
 
 def build_fixed_mask(frames_dir, frames, wm_x1, wm_y1, wm_x2, wm_y2):
-    """
-    Find the frame with the darkest background in the watermark region,
-    run Otsu there, return the mask. This mask defines exactly where the
-    diamond pixels are — reuse for all frames.
-    """
+    """Find darkest-background frame, build Otsu mask there — reuse for all frames."""
     best_frame = None
     lowest_bg = 999
     step = max(1, len(frames) // 30)
@@ -61,10 +57,9 @@ def build_fixed_mask(frames_dir, frames, wm_x1, wm_y1, wm_x2, wm_y2):
     _, mask = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7,7))
     mask = cv2.dilate(mask, kernel, iterations=2)
-    return mask  # (wm_h, wm_w)
+    return mask
 
 def sample_background(img, wm_x1, wm_y1, wm_x2, wm_y2):
-    """Sample background brightness from a ring around the watermark region."""
     h, w = img.shape[:2]
     pad = 30
     ring = img[max(0,wm_y1-pad):min(h,wm_y2+pad), max(0,wm_x1-pad):min(w,wm_x2+pad)]
@@ -79,35 +74,58 @@ def sample_background(img, wm_x1, wm_y1, wm_x2, wm_y2):
                             cv2.COLOR_BGR2GRAY).flatten()
     return float(np.median(bg_gray))
 
-def inpaint_residual(img, fixed_mask, wm_x1, wm_y1, wm_x2, wm_y2, bg_brightness):
+def gwt_dark_shadow(img_before, img_after, x1, y1, x2, y2, fixed_mask):
     """
-    Within fixed_mask area, find pixels still significantly above background
-    and inpaint them using the fixed mask (not re-thresholded per frame).
+    Detect if GWT over-subtracted and left a dark shadow patch.
+    We look at pixels inside the fixed mask that got significantly darkened
+    beyond what watermark removal should cause.
     """
-    region = img[wm_y1:wm_y2, wm_x1:wm_x2]
-    gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
+    rb = img_before[y1:y2, x1:x2]
+    ra = img_after[y1:y2, x1:x2]
+    gb = cv2.cvtColor(rb, cv2.COLOR_BGR2GRAY).astype(int)
+    ga = cv2.cvtColor(ra, cv2.COLOR_BGR2GRAY).astype(int)
+    diff = ga - gb  # negative = darkened
+    # Count mask pixels that got significantly darkened
+    mask_bool = fixed_mask > 0
+    darkened_in_mask = ((diff < -20) & mask_bool).sum()
+    total_mask = mask_bool.sum()
+    # If >30% of the mask pixels are over-darkened, GWT created a dark shadow
+    return (darkened_in_mask / max(1, total_mask)) > 0.30
 
-    # Residual = pixels inside the diamond mask that are still too bright
-    threshold = bg_brightness + 25
-    residual = ((gray > threshold) & (fixed_mask > 0)).astype(np.uint8) * 255
-
-    if residual.sum() == 0:
-        return img, False  # nothing to fix
-
-    # Use the full fixed mask for inpainting (cleaner edges than just residual pixels)
+def inpaint_fixed_mask(img, fixed_mask, wm_x1, wm_y1, wm_x2, wm_y2, radius=15):
+    """Inpaint the fixed diamond mask with given radius for texture reconstruction."""
     h, w = img.shape[:2]
     full_mask = np.zeros((h, w), np.uint8)
     full_mask[wm_y1:wm_y2, wm_x1:wm_x2] = fixed_mask
-
-    pad = 20
+    pad = 30
     ry1, ry2 = max(0,wm_y1-pad), min(h,wm_y2+pad)
     rx1, rx2 = max(0,wm_x1-pad), min(w,wm_x2+pad)
     sub = img[ry1:ry2, rx1:rx2].copy()
     sub_mask = full_mask[ry1:ry2, rx1:rx2]
-    inpainted = cv2.inpaint(sub, sub_mask, 3, cv2.INPAINT_TELEA)
+    inpainted = cv2.inpaint(sub, sub_mask, radius, cv2.INPAINT_TELEA)
     result = img.copy()
     result[ry1:ry2, rx1:rx2] = inpainted
-    return result, True
+    return result
+
+def fix_residual(img_after, fixed_mask, wm_x1, wm_y1, wm_x2, wm_y2, bg_brightness):
+    """Fix any bright residual after GWT (small inpaint radius, just residual pixels)."""
+    region = img_after[wm_y1:wm_y2, wm_x1:wm_x2]
+    gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
+    residual = ((gray > bg_brightness + 15) & (fixed_mask > 0)).astype(np.uint8) * 255
+    if residual.sum() == 0:
+        return img_after
+    h, w = img_after.shape[:2]
+    full_mask = np.zeros((h, w), np.uint8)
+    full_mask[wm_y1:wm_y2, wm_x1:wm_x2] = residual
+    pad = 20
+    ry1, ry2 = max(0,wm_y1-pad), min(h,wm_y2+pad)
+    rx1, rx2 = max(0,wm_x1-pad), min(w,wm_x2+pad)
+    sub = img_after[ry1:ry2, rx1:rx2].copy()
+    sub_mask = full_mask[ry1:ry2, rx1:rx2]
+    inpainted = cv2.inpaint(sub, sub_mask, 5, cv2.INPAINT_TELEA)
+    result = img_after.copy()
+    result[ry1:ry2, rx1:rx2] = inpainted
+    return result
 
 def process(input_path, output_path):
     print(f"Input:  {input_path}")
@@ -134,13 +152,15 @@ def process(input_path, output_path):
         print("Building fixed diamond mask from reference frame...")
         fixed_mask = build_fixed_mask(frames_dir, frames, wm_x1, wm_y1, wm_x2, wm_y2)
 
-        residual_count = 0
-        print("Processing: GWT snap on every frame, fixed-mask residual cleanup...")
+        gwt_ok = 0
+        shadow_fixed = 0
+
+        print("Processing: GWT snap, dark-shadow detection, fallback inpaint...")
         for i, fname in enumerate(frames):
             path = os.path.join(frames_dir, fname)
             img_before = cv2.imread(path)
 
-            # Step 1: GWT reverse alpha blending
+            # GWT reverse alpha blending
             subprocess.run([GWT, "-i", path, "-o", path,
                 "--snap", "--fallback-region", region_str,
                 "--snap-threshold", "0.05",
@@ -149,17 +169,23 @@ def process(input_path, output_path):
 
             img_after = cv2.imread(path)
 
-            # Step 2: Measure background, then check/fix residual using fixed mask
-            bg = sample_background(img_after, wm_x1, wm_y1, wm_x2, wm_y2)
-            result, had_residual = inpaint_residual(img_after, fixed_mask,
-                                                     wm_x1, wm_y1, wm_x2, wm_y2, bg)
-            if had_residual:
-                residual_count += 1
+            # Check if GWT left a dark shadow in the mask area
+            if gwt_dark_shadow(img_before, img_after, wm_x1, wm_y1, wm_x2, wm_y2, fixed_mask):
+                # GWT over-subtracted — inpaint the original with large radius
+                result = inpaint_fixed_mask(img_before, fixed_mask,
+                                            wm_x1, wm_y1, wm_x2, wm_y2, radius=15)
+                shadow_fixed += 1
+            else:
+                # GWT worked — fix any leftover bright residual
+                bg = sample_background(img_after, wm_x1, wm_y1, wm_x2, wm_y2)
+                result = fix_residual(img_after, fixed_mask,
+                                      wm_x1, wm_y1, wm_x2, wm_y2, bg)
+                gwt_ok += 1
 
             cv2.imwrite(path, result)
 
             if (i+1) % 20 == 0 or (i+1) == len(frames):
-                print(f"  {i+1}/{len(frames)}  (residual cleanups: {residual_count})")
+                print(f"  {i+1}/{len(frames)}  (gwt_ok={gwt_ok}, shadow_fixed={shadow_fixed})")
 
         fps = get_fps(input_path)
         print(f"Re-encoding at {fps:.3f} fps...")
@@ -173,7 +199,7 @@ def process(input_path, output_path):
             "-c:a","copy", output_path], check=True)
 
     print(f"Done -> {output_path}")
-    print(f"{residual_count}/{len(frames)} frames needed residual cleanup")
+    print(f"Summary: {gwt_ok} frames GWT clean, {shadow_fixed} frames inpainted from original")
 
 if __name__ == "__main__":
     import argparse

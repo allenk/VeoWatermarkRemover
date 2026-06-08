@@ -75,7 +75,7 @@ def build_mask(frame: np.ndarray, x1: int, y1: int, x2: int, y2: int) -> np.ndar
 
 def inpaint_frame(frame: np.ndarray, full_mask: np.ndarray,
                   x1: int, y1: int, x2: int, y2: int,
-                  pad: int = 20, radius: int = 12) -> np.ndarray:
+                  pad: int = 20, radius: int = 3) -> np.ndarray:
     """Inpaint the watermark region using surrounding context."""
     h, w = frame.shape[:2]
     ry1, ry2 = max(0, y1 - pad), min(h, y2 + pad)

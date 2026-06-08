@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """
 Hybrid watermark removal:
-1. GWT snap (reverse alpha blending) — handles the main diamond
-2. Tight inpaint pass on any remaining bright residual pixels
+1. Build a fixed diamond mask from the best reference frame (dark background).
+2. Run GWT snap on each frame for reverse alpha blending.
+3. Within the fixed mask area, check if significant residual remains.
+   If yes: inpaint only those residual pixels using the fixed mask.
+   This avoids per-frame Otsu which mistakenly picks up skin/fabric.
 """
 import os, sys, subprocess, tempfile
 import cv2, numpy as np
@@ -33,47 +36,78 @@ def detect_region(frame_path):
             min(w,roi_x+x_max+pad)-max(0,roi_x+x_min-pad),
             min(h,roi_y+y_max+pad)-max(0,roi_y+y_min-pad))
 
-def cleanup_residual(img_before, img_after, x1, y1, x2, y2):
-    """After GWT, inpaint pixels that are still brighter than expected background."""
-    region_before = img_before[y1:y2, x1:x2]
-    region_after  = img_after[y1:y2, x1:x2]
+def build_fixed_mask(frames_dir, frames, wm_x1, wm_y1, wm_x2, wm_y2):
+    """
+    Find the frame with the darkest background in the watermark region,
+    run Otsu there, return the mask. This mask defines exactly where the
+    diamond pixels are — reuse for all frames.
+    """
+    best_frame = None
+    lowest_bg = 999
+    step = max(1, len(frames) // 30)
+    for fname in frames[::step]:
+        img = cv2.imread(os.path.join(frames_dir, fname))
+        region = img[wm_y1:wm_y2, wm_x1:wm_x2]
+        gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
+        bg = float(np.percentile(gray, 25))
+        if bg < lowest_bg:
+            lowest_bg = bg
+            best_frame = fname
 
-    # Sample expected background from a ring around the watermark
-    pad = 25
-    h, w = img_after.shape[:2]
-    ring = img_after[max(0,y1-pad):min(h,y2+pad), max(0,x1-pad):min(w,x2+pad)]
+    print(f"  Reference frame for mask: {best_frame} (bg Q25={lowest_bg:.1f})")
+    img = cv2.imread(os.path.join(frames_dir, best_frame))
+    region = img[wm_y1:wm_y2, wm_x1:wm_x2]
+    gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
+    _, mask = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7,7))
+    mask = cv2.dilate(mask, kernel, iterations=2)
+    return mask  # (wm_h, wm_w)
+
+def sample_background(img, wm_x1, wm_y1, wm_x2, wm_y2):
+    """Sample background brightness from a ring around the watermark region."""
+    h, w = img.shape[:2]
+    pad = 30
+    ring = img[max(0,wm_y1-pad):min(h,wm_y2+pad), max(0,wm_x1-pad):min(w,wm_x2+pad)]
     ring_mask = np.ones(ring.shape[:2], bool)
-    ry = pad if y1>=pad else y1
-    rx = pad if x1>=pad else x1
-    ring_mask[ry:ry+(y2-y1), rx:rx+(x2-x1)] = False
-    bg_median = np.median(ring[ring_mask].reshape(-1,3), axis=0)
+    ry = pad if wm_y1>=pad else wm_y1
+    rx = pad if wm_x1>=pad else wm_x1
+    ring_mask[ry:ry+(wm_y2-wm_y1), rx:rx+(wm_x2-wm_x1)] = False
+    bg_pixels = ring[ring_mask]
+    if len(bg_pixels) == 0:
+        return 50.0
+    bg_gray = cv2.cvtColor(bg_pixels.reshape(-1,1,3).astype(np.uint8),
+                            cv2.COLOR_BGR2GRAY).flatten()
+    return float(np.median(bg_gray))
 
-    # Residual = processed pixels still brighter than expected background
-    gray_after = cv2.cvtColor(region_after, cv2.COLOR_BGR2GRAY)
-    bg_brightness = float(np.mean(bg_median))
-    residual_mask = (gray_after > bg_brightness + 35).astype(np.uint8) * 255
+def inpaint_residual(img, fixed_mask, wm_x1, wm_y1, wm_x2, wm_y2, bg_brightness):
+    """
+    Within fixed_mask area, find pixels still significantly above background
+    and inpaint them using the fixed mask (not re-thresholded per frame).
+    """
+    region = img[wm_y1:wm_y2, wm_x1:wm_x2]
+    gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
 
-    if residual_mask.sum() == 0:
-        return img_after  # nothing to fix
+    # Residual = pixels inside the diamond mask that are still too bright
+    threshold = bg_brightness + 25
+    residual = ((gray > threshold) & (fixed_mask > 0)).astype(np.uint8) * 255
 
-    # Dilate slightly to catch edges
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5,5))
-    residual_mask = cv2.dilate(residual_mask, kernel, iterations=1)
+    if residual.sum() == 0:
+        return img, False  # nothing to fix
 
-    # Inpaint only the residual region with small radius
-    full_mask = np.zeros(img_after.shape[:2], np.uint8)
-    full_mask[y1:y2, x1:x2] = residual_mask
+    # Use the full fixed mask for inpainting (cleaner edges than just residual pixels)
+    h, w = img.shape[:2]
+    full_mask = np.zeros((h, w), np.uint8)
+    full_mask[wm_y1:wm_y2, wm_x1:wm_x2] = fixed_mask
 
-    rpad = 20
-    ry1, ry2 = max(0,y1-rpad), min(h,y2+rpad)
-    rx1, rx2 = max(0,x1-rpad), min(w,x2+rpad)
-    sub = img_after[ry1:ry2, rx1:rx2].copy()
+    pad = 20
+    ry1, ry2 = max(0,wm_y1-pad), min(h,wm_y2+pad)
+    rx1, rx2 = max(0,wm_x1-pad), min(w,wm_x2+pad)
+    sub = img[ry1:ry2, rx1:rx2].copy()
     sub_mask = full_mask[ry1:ry2, rx1:rx2]
     inpainted = cv2.inpaint(sub, sub_mask, 3, cv2.INPAINT_TELEA)
-
-    result = img_after.copy()
+    result = img.copy()
     result[ry1:ry2, rx1:rx2] = inpainted
-    return result
+    return result, True
 
 def process(input_path, output_path):
     print(f"Input:  {input_path}")
@@ -88,7 +122,6 @@ def process(input_path, output_path):
         frames = sorted(f for f in os.listdir(frames_dir) if f.endswith(".png"))
         print(f"{len(frames)} frames")
 
-        # Detect region from first frame
         first = os.path.join(frames_dir, frames[0])
         region = detect_region(first)
         if not region:
@@ -96,9 +129,13 @@ def process(input_path, output_path):
         rx, ry, rw, rh = region
         region_str = f"{rx},{ry},{rw},{rh}"
         wm_x1, wm_y1, wm_x2, wm_y2 = rx+40, ry+40, rx+rw-40, ry+rh-40
-        print(f"Watermark region: ({wm_x1},{wm_y1})-({wm_x2},{wm_y2}), search: {region_str}")
+        print(f"Watermark: ({wm_x1},{wm_y1})-({wm_x2},{wm_y2}), GWT search: {region_str}")
 
-        print("Processing with GWT snap + residual cleanup...")
+        print("Building fixed diamond mask from reference frame...")
+        fixed_mask = build_fixed_mask(frames_dir, frames, wm_x1, wm_y1, wm_x2, wm_y2)
+
+        residual_count = 0
+        print("Processing: GWT snap on every frame, fixed-mask residual cleanup...")
         for i, fname in enumerate(frames):
             path = os.path.join(frames_dir, fname)
             img_before = cv2.imread(path)
@@ -112,12 +149,17 @@ def process(input_path, output_path):
 
             img_after = cv2.imread(path)
 
-            # Step 2: clean up any residual
-            result = cleanup_residual(img_before, img_after, wm_x1, wm_y1, wm_x2, wm_y2)
+            # Step 2: Measure background, then check/fix residual using fixed mask
+            bg = sample_background(img_after, wm_x1, wm_y1, wm_x2, wm_y2)
+            result, had_residual = inpaint_residual(img_after, fixed_mask,
+                                                     wm_x1, wm_y1, wm_x2, wm_y2, bg)
+            if had_residual:
+                residual_count += 1
+
             cv2.imwrite(path, result)
 
             if (i+1) % 20 == 0 or (i+1) == len(frames):
-                print(f"  {i+1}/{len(frames)}")
+                print(f"  {i+1}/{len(frames)}  (residual cleanups: {residual_count})")
 
         fps = get_fps(input_path)
         print(f"Re-encoding at {fps:.3f} fps...")
@@ -131,6 +173,7 @@ def process(input_path, output_path):
             "-c:a","copy", output_path], check=True)
 
     print(f"Done -> {output_path}")
+    print(f"{residual_count}/{len(frames)} frames needed residual cleanup")
 
 if __name__ == "__main__":
     import argparse

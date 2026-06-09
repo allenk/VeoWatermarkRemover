@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
 """
-Hybrid watermark removal (v12):
-1. Run GWT snap WITHOUT --denoise ai (reverse alpha blending removes bright diamond).
-2. Build a fixed diamond mask once from the darkest-background reference frame.
-3. Inpaint the full fixed mask with TELEA radius=12 — this cleanly replaces
-   the semi-transparent edge/outline ring that GWT leaves behind, without
-   the blurry-square artifact that --denoise ai caused.
+Watermark removal (v14) — patch-copy with feathered blend.
+
+For each frame:
+1. Detect the bright watermark pixels (threshold = background + 20, small dilation).
+2. Build a non-watermark boundary mask (outer ring of the diamond, clean fabric).
+3. Use cv2.matchTemplate (masked, fast) to find the best-matching fabric patch
+   in the surrounding shirt region.
+4. Copy that patch over the watermark area.
+5. Feather the seam: inside the watermark mask → 100% patch; outside in a
+   12 px ring → smooth patch→original blend (fabric-to-fabric, no bright pixels).
+
+Falls back to TELEA inpaint if no good patch is found (SSD too high).
 """
 import os, sys, subprocess, tempfile
 import cv2, numpy as np
-
-GWT = r"C:\Users\Murat\Projects\VeoWatermarkRemover\GeminiWatermarkTool-Video.exe"
 
 def get_fps(path):
     r = subprocess.run(["ffprobe","-v","error","-select_streams","v:0",
@@ -23,7 +27,7 @@ def get_fps(path):
 def detect_region(frame_path):
     img = cv2.imread(frame_path)
     h, w = img.shape[:2]
-    roi_x, roi_y = w-220, h-250  # wide enough to capture diamond left edge
+    roi_x, roi_y = w-220, h-250
     roi = img[roi_y:h, roi_x:w]
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
     bright = (gray > 80).astype(np.uint8)
@@ -32,47 +36,92 @@ def detect_region(frame_path):
     y_min, y_max = coords[0].min(), coords[0].max()
     x_min, x_max = coords[1].min(), coords[1].max()
     pad = 40
-    return (max(0,roi_x+x_min-pad), max(0,roi_y+y_min-pad),
-            min(w,roi_x+x_max+pad)-max(0,roi_x+x_min-pad),
-            min(h,roi_y+y_max+pad)-max(0,roi_y+y_min-pad))
+    return (max(0, roi_x+x_min-pad), max(0, roi_y+y_min-pad),
+            min(w, roi_x+x_max+pad) - max(0, roi_x+x_min-pad),
+            min(h, roi_y+y_max+pad) - max(0, roi_y+y_min-pad))
 
-def build_fixed_mask(frames_dir, frames, wm_x1, wm_y1, wm_x2, wm_y2):
-    """Find darkest-background frame, Otsu+dilation to build diamond mask."""
-    best_frame = None
-    lowest_bg = 999
-    step = max(1, len(frames) // 30)
-    for fname in frames[::step]:
-        img = cv2.imread(os.path.join(frames_dir, fname))
-        region = img[wm_y1:wm_y2, wm_x1:wm_x2]
-        gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
-        bg = float(np.percentile(gray, 25))
-        if bg < lowest_bg:
-            lowest_bg = bg
-            best_frame = fname
-    print(f"  Reference frame for mask: {best_frame} (bg Q25={lowest_bg:.1f})")
-    img = cv2.imread(os.path.join(frames_dir, best_frame))
-    region = img[wm_y1:wm_y2, wm_x1:wm_x2]
-    gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
-    _, mask = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7,7))
-    mask = cv2.dilate(mask, kernel, iterations=2)
-    return mask
-
-def inpaint_diamond(img, fixed_mask, wm_x1, wm_y1, wm_x2, wm_y2,
-                    radius=12):
-    """Inpaint the full diamond mask area to erase outline residual."""
+def remove_watermark(img, wm_x1, wm_y1, wm_x2, wm_y2):
     h, w = img.shape[:2]
-    full_mask = np.zeros((h, w), np.uint8)
-    full_mask[wm_y1:wm_y2, wm_x1:wm_x2] = fixed_mask
-    pad = 30
+    dh, dw = wm_y2-wm_y1, wm_x2-wm_x1
+
+    # ── 1. Sample background brightness from ring around diamond ──────────────
+    pad = 35
     ry1, ry2 = max(0, wm_y1-pad), min(h, wm_y2+pad)
     rx1, rx2 = max(0, wm_x1-pad), min(w, wm_x2+pad)
-    sub = img[ry1:ry2, rx1:rx2].copy()
-    sub_mask = full_mask[ry1:ry2, rx1:rx2]
-    inpainted = cv2.inpaint(sub, sub_mask, radius, cv2.INPAINT_TELEA)
-    result = img.copy()
-    result[ry1:ry2, rx1:rx2] = inpainted
-    return result
+    ring_crop = img[ry1:ry2, rx1:rx2]
+    ring_mask = np.ones(ring_crop.shape[:2], bool)
+    iy = wm_y1-ry1; ix = wm_x1-rx1
+    ring_mask[iy:iy+dh, ix:ix+dw] = False
+    bg_pixels = ring_crop[ring_mask]
+    if len(bg_pixels) == 0:
+        bg = 50.0
+    else:
+        bg = float(np.median(cv2.cvtColor(bg_pixels.reshape(-1,1,3).astype(np.uint8),
+                                          cv2.COLOR_BGR2GRAY).flatten()))
+
+    # ── 2. Build watermark mask (bright pixels inside diamond area) ───────────
+    region = img[wm_y1:wm_y2, wm_x1:wm_x2]
+    gray   = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
+    wm_mask = (gray > bg + 20).astype(np.uint8)
+    k3 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3,3))
+    wm_mask = cv2.dilate(wm_mask, k3, iterations=1)
+    if wm_mask.sum() == 0:
+        return img  # nothing to remove
+
+    # ── 3. Build non-watermark boundary for template matching ─────────────────
+    k15 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15,15))
+    outer_ring = cv2.dilate(wm_mask, k15) - wm_mask   # clean fabric ring outside diamond
+    match_mask = outer_ring.astype(np.uint8) * 255     # only match on these known-good pixels
+
+    templ = region.copy()                              # full dh×dw template
+    templ_gray = cv2.cvtColor(templ, cv2.COLOR_BGR2GRAY)
+
+    # ── 4. Search for best patch using matchTemplate (masked, fast) ───────────
+    search_expand = 120
+    sy1 = max(0, wm_y1 - search_expand)
+    sy2 = min(h - dh, wm_y2 + search_expand)
+    sx1 = max(dw, wm_x1 - 300)
+    sx2 = max(sx1+dw, wm_x1 - 2)      # search only to the left (clean shirt)
+
+    best_loc = None
+    if sx2 - sx1 >= dw and sy2 - sy1 >= dh:
+        search_region = cv2.cvtColor(img[sy1:sy2+dh, sx1:sx2+dw], cv2.COLOR_BGR2GRAY).astype(np.float32)
+        templ_f = templ_gray.astype(np.float32)
+        mask_f  = match_mask.astype(np.float32)
+        try:
+            result = cv2.matchTemplate(search_region, templ_f, cv2.TM_SQDIFF, mask=mask_f)
+            _, _, min_loc, _ = cv2.minMaxLoc(result)
+            best_loc = (sx1 + min_loc[0], sy1 + min_loc[1])
+        except Exception:
+            pass
+
+    # ── 5. Copy best patch with feathered blend ───────────────────────────────
+    if best_loc is not None:
+        bx, by = best_loc
+        # guard against going out of bounds
+        if (by+dh <= h and bx+dw <= w and
+                not (bx == wm_x1 and by == wm_y1)):
+            best_patch = img[by:by+dh, bx:bx+dw].copy()
+
+            # Feather: 1.0 inside mask, smooth 1→0 in 12px ring outside mask
+            dist_out   = cv2.distanceTransform(1-wm_mask, cv2.DIST_L2, 3)
+            feather    = np.where(wm_mask > 0, 1.0, np.clip(1.0 - dist_out/12.0, 0.0, 1.0))
+            feather_3  = np.stack([feather]*3, axis=2)
+
+            blended = (best_patch.astype(float) * feather_3 +
+                       region.astype(float) * (1.0 - feather_3))
+            result_img = img.copy()
+            result_img[wm_y1:wm_y2, wm_x1:wm_x2] = np.clip(blended, 0, 255).astype(np.uint8)
+            return result_img
+
+    # ── 6. Fallback: TELEA inpaint ────────────────────────────────────────────
+    full_mask = np.zeros((h, w), np.uint8)
+    full_mask[wm_y1:wm_y2, wm_x1:wm_x2] = wm_mask * 255
+    sub  = img[ry1:ry2, rx1:rx2].copy()
+    inp  = cv2.inpaint(sub, full_mask[ry1:ry2, rx1:rx2], 7, cv2.INPAINT_TELEA)
+    res  = img.copy()
+    res[ry1:ry2, rx1:rx2] = inp
+    return res
 
 def process(input_path, output_path):
     print(f"Input:  {input_path}")
@@ -92,28 +141,15 @@ def process(input_path, output_path):
         if not region:
             print("ERROR: watermark region not found"); sys.exit(1)
         rx, ry, rw, rh = region
-        region_str = f"{rx},{ry},{rw},{rh}"
         wm_x1, wm_y1, wm_x2, wm_y2 = rx+40, ry+40, rx+rw-40, ry+rh-40
-        print(f"Watermark: ({wm_x1},{wm_y1})-({wm_x2},{wm_y2}), GWT search: {region_str}")
+        print(f"Watermark region: ({wm_x1},{wm_y1})-({wm_x2},{wm_y2})")
 
-        print("Building fixed diamond mask...")
-        fixed_mask = build_fixed_mask(frames_dir, frames, wm_x1, wm_y1, wm_x2, wm_y2)
-
-        print("Processing: GWT snap (no denoise) + TELEA inpaint r=12 ...")
+        print("Processing: patch-copy + feather blend ...")
         for i, fname in enumerate(frames):
             path = os.path.join(frames_dir, fname)
-
-            # Step 1: GWT snap without denoising
-            subprocess.run([GWT, "-i", path, "-o", path,
-                "--snap", "--fallback-region", region_str,
-                "--snap-threshold", "0.05"],
-                capture_output=True)
-
-            # Step 2: inpaint full diamond mask to remove outline residual
-            img = cv2.imread(path)
-            result = inpaint_diamond(img, fixed_mask, wm_x1, wm_y1, wm_x2, wm_y2)
+            img  = cv2.imread(path)
+            result = remove_watermark(img, wm_x1, wm_y1, wm_x2, wm_y2)
             cv2.imwrite(path, result)
-
             if (i+1) % 20 == 0 or (i+1) == len(frames):
                 print(f"  {i+1}/{len(frames)}")
 

@@ -62,9 +62,10 @@ def remove_watermark(img, wm_x1, wm_y1, wm_x2, wm_y2):
     # ── 2. Build watermark mask (bright pixels inside diamond area) ───────────
     region = img[wm_y1:wm_y2, wm_x1:wm_x2]
     gray   = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
-    wm_mask = (gray > bg + 20).astype(np.uint8)
-    k3 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3,3))
-    wm_mask = cv2.dilate(wm_mask, k3, iterations=1)
+    # Lower threshold + larger dilation to catch semi-transparent edge pixels
+    wm_mask = (gray > bg + 12).astype(np.uint8)
+    k5 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5,5))
+    wm_mask = cv2.dilate(wm_mask, k5, iterations=2)
     if wm_mask.sum() == 0:
         return img  # nothing to remove
 
@@ -77,42 +78,60 @@ def remove_watermark(img, wm_x1, wm_y1, wm_x2, wm_y2):
     templ_gray = cv2.cvtColor(templ, cv2.COLOR_BGR2GRAY)
 
     # ── 4. Search for best patch using matchTemplate (masked, fast) ───────────
-    search_expand = 120
-    sy1 = max(0, wm_y1 - search_expand)
-    sy2 = min(h - dh, wm_y2 + search_expand)
-    sx1 = max(dw, wm_x1 - 300)
-    sx2 = max(sx1+dw, wm_x1 - 2)      # search only to the left (clean shirt)
+    # Search ABOVE the watermark (same shirt, same vertical column) — avoids
+    # the person's arm/hand that can enter from the left at later timestamps.
+    # Keep vertical range tight (≤100 px) so we don't reach neck/beads/off-fabric.
+    search_x_lo = max(0,   wm_x1 - 60)
+    search_x_hi = min(w - dw, wm_x2 + 10)
+    search_y_lo = max(0,   wm_y1 - 100)
+    search_y_hi = wm_y1 - 15              # stop well before the watermark row
 
-    best_loc = None
-    if sx2 - sx1 >= dw and sy2 - sy1 >= dh:
-        search_region = cv2.cvtColor(img[sy1:sy2+dh, sx1:sx2+dw], cv2.COLOR_BGR2GRAY).astype(np.float32)
-        templ_f = templ_gray.astype(np.float32)
-        mask_f  = match_mask.astype(np.float32)
+    # Sample background color (BGR) from the ring for color-consistency check
+    bg_bgr = np.median(ring_crop[ring_mask].reshape(-1,3).astype(float), axis=0)  # [B,G,R]
+
+    def _find_patch(sx1, sx2, sy1, sy2):
+        if sx2 - sx1 < dw or sy2 - sy1 < dh:
+            return None
+        sr = cv2.cvtColor(img[sy1:sy2+dh, sx1:sx2+dw], cv2.COLOR_BGR2GRAY).astype(np.float32)
         try:
-            result = cv2.matchTemplate(search_region, templ_f, cv2.TM_SQDIFF, mask=mask_f)
-            _, _, min_loc, _ = cv2.minMaxLoc(result)
-            best_loc = (sx1 + min_loc[0], sy1 + min_loc[1])
+            res = cv2.matchTemplate(sr, templ_gray.astype(np.float32),
+                                    cv2.TM_SQDIFF, mask=match_mask.astype(np.float32))
+            _, _, mloc, _ = cv2.minMaxLoc(res)
+            return (sx1 + mloc[0], sy1 + mloc[1])
         except Exception:
-            pass
+            return None
+
+    best_loc = _find_patch(search_x_lo, search_x_hi, search_y_lo, search_y_hi)
+    # Fallback: also try left of watermark if above search fails validation
+    best_loc_left = _find_patch(max(dw, wm_x1-320), wm_x1-dw-10,
+                                max(0, wm_y1-150), min(h-dh, wm_y2+150))
+
+    def _patch_valid(bx, by):
+        """Return patch if its brightness AND color match the background."""
+        if bx is None or by is None: return None
+        if by+dh > h or bx+dw > w: return None
+        if bx == wm_x1 and by == wm_y1: return None
+        p = img[by:by+dh, bx:bx+dw].copy()
+        pg = cv2.cvtColor(p, cv2.COLOR_BGR2GRAY).astype(float)
+        if abs(pg.mean() - bg) > 20: return None          # brightness check
+        p_bgr = np.median(p.reshape(-1,3).astype(float), axis=0)
+        if np.max(np.abs(p_bgr - bg_bgr)) > 15: return None  # per-channel color check
+        return p
+
+    best_patch = (_patch_valid(*best_loc) if best_loc else None or
+                  _patch_valid(*best_loc_left) if best_loc_left else None)
 
     # ── 5. Copy best patch with feathered blend ───────────────────────────────
-    if best_loc is not None:
-        bx, by = best_loc
-        # guard against going out of bounds
-        if (by+dh <= h and bx+dw <= w and
-                not (bx == wm_x1 and by == wm_y1)):
-            best_patch = img[by:by+dh, bx:bx+dw].copy()
-
-            # Feather: 1.0 inside mask, smooth 1→0 in 12px ring outside mask
-            dist_out   = cv2.distanceTransform(1-wm_mask, cv2.DIST_L2, 3)
-            feather    = np.where(wm_mask > 0, 1.0, np.clip(1.0 - dist_out/12.0, 0.0, 1.0))
-            feather_3  = np.stack([feather]*3, axis=2)
-
-            blended = (best_patch.astype(float) * feather_3 +
-                       region.astype(float) * (1.0 - feather_3))
-            result_img = img.copy()
-            result_img[wm_y1:wm_y2, wm_x1:wm_x2] = np.clip(blended, 0, 255).astype(np.uint8)
-            return result_img
+    if best_patch is not None:
+        # Feather: 1.0 inside mask, smooth 1→0 in 12px ring outside mask
+        dist_out  = cv2.distanceTransform(1-wm_mask, cv2.DIST_L2, 3)
+        feather   = np.where(wm_mask > 0, 1.0, np.clip(1.0 - dist_out/12.0, 0.0, 1.0))
+        feather_3 = np.stack([feather]*3, axis=2)
+        blended   = (best_patch.astype(float) * feather_3 +
+                     region.astype(float) * (1.0 - feather_3))
+        result_img = img.copy()
+        result_img[wm_y1:wm_y2, wm_x1:wm_x2] = np.clip(blended, 0, 255).astype(np.uint8)
+        return result_img
 
     # ── 6. Fallback: TELEA inpaint ────────────────────────────────────────────
     full_mask = np.zeros((h, w), np.uint8)

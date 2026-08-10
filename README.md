@@ -21,7 +21,14 @@ Remove the "Veo" text watermark from Google Veo-generated videos using **mathema
 
 No cloud services. No generative fill, no hallucinated pixels, no quality loss — the removal is pure, reversible math. An optional on-device ML assist (`--ml`) can fine-tune the intensity on tricky clips.
 
-## What's New (v0.6.4)
+## What's New (v0.6.5)
+
+- **Half-scale "stamped" diamonds are now found and removed** ([#31](https://github.com/allenk/VeoWatermarkRemover/issues/31)). Some newer clips (free-tier / API-stamped outputs) carry a much smaller diamond — about half the usual size, at a nonstandard corner position. Previous versions could lock onto look-alike scene content nearby and report success while the real watermark stayed put. The smart search now scans down to these small sizes and holds candidates to a stricter, data-calibrated bar, so the real diamond wins.
+- **`--region x,y,w,h` now works on video.** When a watermark sits somewhere auto-detect doesn't know yet, you can lock the exact spot yourself (find it with the GUI snap tool or by eye) and pair it with `--veo-alpha` for intensity — e.g. `--region "1221,656,22,22" --veo-alpha 0.98`. No `--region` = unchanged auto behavior.
+- **Fewer missed frames on bright, busy backgrounds.** The "watermark is occluded, skip this frame" guard now accounts for how faint a watermark *physically can be* over a bright background (ocean foam, snow) instead of using a fixed bar — a fully visible diamond no longer slips through on a single frame.
+- **Fix for "diamond turns black" on old Intel iGPUs** ([#28](https://github.com/allenk/VeoWatermarkRemover/issues/28)). On systems whose Vulkan driver is present but broken (Mesa warns "Haswell Vulkan support is incomplete"), the AI denoise step could output a black patch. Device selection now skips broken and software-emulated Vulkan devices (llvmpipe/lavapipe & friends) and falls back to the fast native CPU path automatically. You can also force CPU outright with the new `--cpu` flag (or `GWT_CPU_DENOISE=1` for scripts).
+
+## Previous Release Highlights (v0.6.4)
 
 - **More stable by default — the ML assist is now opt-in (`--ml`).** v0.6.3 turned the "Alpha Judge" ML intensity predictor on by default. Across the huge variety of real-world clips, though, it occasionally over-corrected and made a clip *worse* than the plain analytical estimate. So the default is back to the **proven, predictable analytical intensity** — reliable for the common case — and Alpha Judge is now a one-flag opt-in (`--ml`) for the minority of clips whose intensity genuinely varies a lot. By default the tool no longer spins up the GPU for ML either, so it starts clean on more systems.
 - **New "Veo" text — more reliable detection + 1080p support.** Fixed a case where a clip with the small "Veo" text over a busy foreground (e.g. shot through grass) was misread as the Gemini diamond and left the text in place ([#18](https://github.com/allenk/VeoWatermarkRemover/issues/18)) — it's now identified correctly. Also added the **1080p** small "Veo" wordmark (v0.6.3 handled 720p only).
